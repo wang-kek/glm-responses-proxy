@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
 from .request_capture import REQUEST_CAPTURE_LOG, capture_request, set_capture_log
+from .traffic_stats import traffic_stats
 
 
 # ===================== 配置 =====================
@@ -74,7 +75,9 @@ def summarize_headers(headers: dict) -> dict:
 async def lifespan(app: FastAPI):
     global client
     client = httpx.AsyncClient(timeout=None)
+    traffic_stats.start_periodic_log(logger, interval=60)
     yield
+    traffic_stats.stop_periodic_log()
     if client is not None:
         await client.aclose()
 
@@ -1436,8 +1439,26 @@ async def responses_proxy(request: Request):
     text_format = get_requested_text_format(body)
 
     if stream:
+        upstream_base_url, selected_model = select_upstream(chat_body)
+        chat_body["model"] = selected_model
+
+        async def tracked_responses_stream():
+            total_bytes = 0
+            async for chunk in responses_stream_generator(chat_body, headers, text_format=text_format):
+                total_bytes += len(chunk) if isinstance(chunk, (bytes, bytearray)) else len(chunk.encode("utf-8")) if isinstance(chunk, str) else 0
+                yield chunk
+            traffic_stats.record(
+                route="/v1/responses",
+                stream=True,
+                upstream=upstream_base_url,
+                model=selected_model,
+                req_bytes=len(json.dumps(chat_body).encode("utf-8")),
+                resp_bytes=total_bytes,
+                usage=None,
+            )
+
         return StreamingResponse(
-            responses_stream_generator(chat_body, headers, text_format=text_format),
+            tracked_responses_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1468,7 +1489,17 @@ async def responses_proxy(request: Request):
 
     chat_data = resp.json()
     logger.debug("responses non-stream upstream body=%s", summarize_payload(chat_data))
-    return convert_chat_to_responses(chat_data, text_format=text_format)
+    responses_result = convert_chat_to_responses(chat_data, text_format=text_format)
+    traffic_stats.record(
+        route="/v1/responses",
+        stream=False,
+        upstream=upstream_base_url,
+        model=selected_model,
+        req_bytes=len(await request.body()) if hasattr(request, '_body') else 0,
+        resp_bytes=len(resp.content),
+        usage=chat_data.get("usage"),
+    )
+    return responses_result
 
 
 @app.get("/v1/models")
@@ -1553,6 +1584,15 @@ async def chat_proxy(request: Request):
         if resp.status_code in (401, 403):
             return key_error_response(resp.status_code)
 
+        traffic_stats.record(
+            route="/v1/chat/completions",
+            stream=False,
+            upstream=upstream_base_url,
+            model=selected_model,
+            req_bytes=len(json.dumps(body).encode("utf-8")),
+            resp_bytes=len(resp.content),
+            usage=None,
+        )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -1642,8 +1682,23 @@ async def chat_proxy(request: Request):
                 yield chat_done()
                 done_sent = True
 
+    async def tracked_chat_stream():
+        total_bytes = 0
+        async for chunk in chat_stream_generator():
+            total_bytes += len(chunk) if isinstance(chunk, (bytes, bytearray)) else 0
+            yield chunk
+        traffic_stats.record(
+            route="/v1/chat/completions",
+            stream=True,
+            upstream=upstream_base_url,
+            model=selected_model,
+            req_bytes=len(json.dumps(body).encode("utf-8")),
+            resp_bytes=total_bytes,
+            usage=None,
+        )
+
     return StreamingResponse(
-        chat_stream_generator(),
+        tracked_chat_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1667,6 +1722,7 @@ async def root():
             "/v1/chat/completions",
             "/v1/models",
         ],
+        "traffic_stats": traffic_stats.snapshot(),
     }
 
 
