@@ -1,13 +1,13 @@
 """Traffic statistics for the GLM Responses Proxy.
 
 Tracks request counts, token usage, and data volume per endpoint.
-Periodically logs a summary and exposes stats via the /stats endpoint.
+Periodically logs a summary and exposes stats via the root endpoint.
 """
 
 import logging
 import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("glm_proxy.traffic")
 
@@ -24,7 +24,8 @@ class TrafficStats:
         self._counters: Dict[str, Dict[str, Any]] = {}
 
         # Periodic logger state
-        self._timer: threading.Timer | None = None
+        self._timer: Optional[threading.Timer] = None
+        self._logger: Optional[logging.Logger] = None
 
     # ---- internal helpers ----
 
@@ -47,18 +48,20 @@ class TrafficStats:
 
     # ---- public API ----
 
-    def start_periodic_logging(self):
+    def start_periodic_log(self, log: logging.Logger, interval: float = 60.0):
         """Begin logging traffic summaries at the configured interval."""
+        self._logger = log
+        self._log_interval = interval
         self._timer = threading.Timer(self._log_interval, self._periodic_log)
         self._timer.daemon = True
         self._timer.start()
 
-    def stop_periodic_logging(self):
+    def stop_periodic_log(self):
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
 
-    def record_request(
+    def record(
         self,
         endpoint: str,
         *,
@@ -79,7 +82,7 @@ class TrafficStats:
             if error:
                 c["errors"] += 1
 
-    def get_summary(self) -> Dict[str, Any]:
+    def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             uptime_s = time.time() - self._started_at
             endpoints = {}
@@ -111,20 +114,20 @@ class TrafficStats:
             }
 
     def log_summary(self):
-        summary = self.get_summary()
+        summary = self.snapshot()
         parts = [
-            f"uptime={summary['uptime_s']}s",
-            f"requests={summary['total_requests']}",
-            f"errors={summary['total_errors']}",
-            f"in_tokens={summary['total_input_tokens']}",
-            f"out_tokens={summary['total_output_tokens']}",
-            f"req_bytes={summary['total_request_bytes']}",
-            f"resp_bytes={summary['total_response_bytes']}",
+            "uptime={}s".format(summary["uptime_s"]),
+            "requests={}".format(summary["total_requests"]),
+            "errors={}".format(summary["total_errors"]),
+            "in_tokens={}".format(summary["total_input_tokens"]),
+            "out_tokens={}".format(summary["total_output_tokens"]),
+            "req_bytes={}".format(summary["total_request_bytes"]),
+            "resp_bytes={}".format(summary["total_response_bytes"]),
         ]
-        logger.info("traffic summary: %s", " ".join(parts))
+        (self._logger or logger).info("traffic summary: %s", " ".join(parts))
 
         for name, c in sorted(summary["endpoints"].items()):
-            logger.info(
+            (self._logger or logger).info(
                 "  %-25s requests=%d errors=%d in_tok=%d out_tok=%d req_kb=%.1f resp_kb=%.1f",
                 name,
                 c["requests"],
