@@ -193,37 +193,12 @@ The current proxy has been verified against `GLM-5.1-FP8` on the upstream `/v1/c
 ### Important limitations
 
 - This is not full OpenAI Responses parity.
-- Built-in OpenAI-hosted tools such as `web_search`, `file_search`, `computer_use`, and `code_interpreter` are not natively implemented by a local GLM model. They need separate orchestration and infrastructure.
-- `custom` tools are currently downgraded to plain function tools, which helps compatibility but does not preserve full freeform tool semantics.
+- OpenAI-hosted tools such as `web_search`, `file_search`, `computer_use`, and `code_interpreter` work through client-side orchestration: the model decides when to call them, the client executes the call, and results are returned via `function_call_output`. GLM correctly outputs tool call format, so these tools function normally when the client supports them. This proxy passes tool calls through without modification.
+- `custom` tools are currently downgraded to plain function tools, which helps compatibility with upstream schema validation but does not preserve full freeform tool semantics.
 - Response persistence features such as `previous_response_id`, retrieval of stored response items, and hosted conversation state are not implemented.
 - Multimodal support is currently limited to image input routing and image understanding output.
 - General `input_file` parsing, PDF parsing, and audio input are not fully implemented.
 - Event shapes are close to Responses semantics for Codex-style usage, but not guaranteed to match OpenAI behavior in every field.
-
-## Recommendation
-
-If your goal is to cover more of the modern Responses-style agent workflow locally, a practical direction is:
-
-- For text, reasoning, tool calling, and structured output: Deploy a Qwen3 or Qwen3-Coder model on vLLM, with the appropriate reasoning parser and tool-call parser.
-- For image and UI understanding: Add a Qwen2.5-VL model as a second upstream service.
-- For audio/video/speech style multimodal work: Add a Qwen2.5-Omni class model, but expect extra serving complexity.
-
-### Suggested deployment path
-
-1. Keep `GLM-5.1-FP8` if your main need is Chinese text reasoning plus basic function calls.
-2. If you want stronger local agent compatibility for tool-heavy coding workflows, prefer a Qwen3 or Qwen3-Coder deployment on vLLM.
-3. If you want to approach broader Responses coverage, split responsibilities:
-   - text/tools: Qwen3 or Qwen3-Coder
-   - vision: Qwen2.5-VL
-   - audio/video: Qwen2.5-Omni
-
-### Practical advice
-
-Even with a stronger local model, full Responses parity usually requires more than a model swap. You will still need:
-
-- a proxy layer that normalizes tool schemas and stream events
-- an orchestration layer for hosted-tool equivalents
-- storage if you want retrievable responses or server-managed conversation history
 
 ## Project Layout
 
@@ -445,37 +420,12 @@ python scripts/verify_responses_proxy.py \
 ### 重要限制
 
 - 这不是完整的 OpenAI Responses 兼容实现
-- OpenAI 托管工具（`web_search`、`file_search`、`computer_use`、`code_interpreter`）不被本地 GLM 模型原生支持，需要额外的编排和基础设施
+- OpenAI 托管工具（`web_search`、`file_search`、`computer_use`、`code_interpreter`）通过客户端编排工作：模型决定何时调用，客户端执行调用，结果通过 `function_call_output` 返回。GLM 能正确输出工具调用格式，因此这些工具在客户端支持时可以正常工作。本代理原样传递工具调用，不做修改
 - `custom` 工具目前降级为普通函数工具，有助于兼容性但不保留自由格式语义
 - 响应持久化功能（`previous_response_id`、存储的响应项、服务端会话状态）未实现
 - 多模态支持目前仅限于图片输入路由和图片理解输出
 - 通用 `input_file` 解析、PDF 解析和音频输入未完全实现
 - 事件形状接近 Codex 风格的 Responses 语义，但不保证在每个字段上都匹配 OpenAI 行为
-
-## 建议
-
-如果目标是本地覆盖更多现代 Responses 风格的 Agent 工作流，实际方向是：
-
-- 文本、推理、工具调用和结构化输出：在 vLLM 上部署 Qwen3 或 Qwen3-Coder 模型，配合相应的推理解析器和工具调用解析器
-- 图片和 UI 理解：添加 Qwen2.5-VL 模型作为第二个上游服务
-- 音频/视频/语音多模态：添加 Qwen2.5-Omni 类模型，但预期会有额外的服务复杂度
-
-### 建议的部署路径
-
-1. 如果主要需求是中文文本推理加基础函数调用，保留 `GLM-5.1-FP8`
-2. 如果需要更强的本地 Agent 兼容性（工具密集型编码工作流），推荐在 vLLM 上部署 Qwen3 或 Qwen3-Coder
-3. 如果要覆盖更广的 Responses 功能，拆分职责：
-   - 文本/工具：Qwen3 或 Qwen3-Coder
-   - 视觉：Qwen2.5-VL
-   - 音频/视频：Qwen2.5-Omni
-
-### 实用建议
-
-即使使用更强的本地模型，完整的 Responses 兼容通常不仅仅是替换模型。你仍然需要：
-
-- 一个代理层来规范化工具 schema 和流式事件
-- 一个编排层来提供等价的托管工具
-- 如果需要可检索的响应或服务端管理的会话历史，还需要存储
 
 ## 项目结构
 
