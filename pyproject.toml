@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glm-responses-proxy"
+version = "0.1.0"
+description = "OpenAI Responses API proxy for GLM-compatible chat/completions backends"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+  { name = "wangkq" }
+]
+dependencies = [
+  "fastapi>=0.110,<1",
+  "httpx>=0.27,<1",
+  "uvicorn>=0.29,<1",
+]
+keywords = ["glm", "responses", "proxy", "fastapi", "openai-compatible"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+]
+
+[project.scripts]
+glm-responses-proxy = "glm_responses_proxy.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
