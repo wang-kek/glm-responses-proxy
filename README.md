@@ -1,5 +1,9 @@
 # GLM Responses Proxy
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688.svg)](https://fastapi.tiangolo.com/)
+
 **English** | [中文](#中文文档)
 
 A lightweight FastAPI proxy that translates OpenAI-style `/v1/responses` requests into `/v1/chat/completions` requests for GLM-compatible upstream backends (such as vLLM).
