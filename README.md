@@ -243,6 +243,13 @@ glm-responses-proxy/
         └── traffic_stats.py
 ```
 
+## Acknowledgments
+
+This project was made possible with the help of:
+
+- **[Codex](https://github.com/openai/codex)** — The codebase was developed with the assistance of OpenAI Codex, which helped write, review, and iterate on the proxy logic, test scripts, and documentation.
+- **[GLM](https://github.com/THUDM/GLM-4)** — The proxy is designed to work with GLM series models (GLM-5.1) served via vLLM, and the protocol compatibility was validated against GLM's chat completions API.
+
 ## License
 
 MIT
@@ -487,6 +494,13 @@ glm-responses-proxy/
         ├── server.py
         └── traffic_stats.py
 ```
+
+## 致谢
+
+本项目的完成离不开以下项目的帮助：
+
+- **[Codex](https://github.com/openai/codex)** — 代码库的开发全程使用了 OpenAI Codex 辅助，包括代理逻辑、测试脚本和文档的编写、审查与迭代。
+- **[GLM](https://github.com/THUDM/GLM-4)** — 本代理专为对接通过 vLLM 部署的 GLM 系列模型（GLM-5.1）而设计，协议兼容性已针对 GLM 的 Chat Completions API 进行了验证。
 
 ## 许可证
 
