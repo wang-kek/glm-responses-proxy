@@ -1,10 +1,14 @@
 import argparse
 import json
 import logging
+import os
+import re
 import time
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
+from xml.etree import ElementTree as ET
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -22,11 +26,33 @@ MULTIMODAL_BASE_URL = ""
 MULTIMODAL_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8080
+TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", "")
 # ===============================================
 
 
 client: Optional[httpx.AsyncClient] = None
 logger = logging.getLogger("glm_proxy")
+CONTEXT_TOKEN_SOFT_LIMIT = 180000
+CONTEXT_TOKEN_HARD_LIMIT = 200000
+TRUNCATED_TEXT_HEAD_CHARS = 12000
+TRUNCATED_TEXT_TAIL_CHARS = 36000
+SUMMARY_TRIGGER_TOKENS = 150000
+SUMMARY_TARGET_MAX_TOKENS = 1200
+SUMMARY_KEEP_RECENT_MESSAGES = 4
+SUMMARY_TRANSCRIPT_MAX_CHARS = 120000
+SUMMARY_MESSAGE_PREFIX = "[glm-responses-proxy summary of earlier conversation]\n"
+TOOL_OUTPUT_MAX_CHARS = 12000
+TOOL_OUTPUT_HEAD_CHARS = 4000
+TOOL_OUTPUT_TAIL_CHARS = 2000
+DOCX_EXTRACT_MAX_CHARS = 16000
+DOCX_DISCOVERY_MAX_DEPTH = 2
+DOCX_DISCOVERY_MAX_CANDIDATES = 12
+TOKENIZER_LOAD_ATTEMPTED = False
+TOKENIZER_LOAD_ERROR = ""
+TOKENIZER = None
+TOKENIZER_MODE = "heuristic"
+DOCX_PATH_PATTERN = re.compile(r"(?P<path>(?:/|\.?/)?[^\s\"'<>]+\.docx)\b", re.IGNORECASE)
+DOCX_NAME_PATTERN = re.compile(r"(?P<name>[^\s/\"'<>]+\.docx)\b", re.IGNORECASE)
 
 
 def parse_args(argv: Optional[List[str]] = None):
@@ -40,6 +66,7 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--capture-log", default="", help="optional request capture log path for testing")
     parser.add_argument("--log-level", default="INFO", help="logging level, e.g. INFO/DEBUG")
     parser.add_argument("--debug", action="store_true", help="enable verbose debug logging")
+    parser.add_argument("--tokenizer", default=TOKENIZER_PATH, help="optional local tokenizer path for token estimation")
     return parser.parse_args(argv)
 
 
@@ -69,6 +96,467 @@ def summarize_headers(headers: dict) -> dict:
         masked["Authorization"] = auth[:16] + "...redacted"
         masked.pop("authorization", None)
     return masked
+
+
+def normalize_response_format_for_upstream(fmt: dict) -> Optional[dict]:
+    if not isinstance(fmt, dict):
+        return None
+
+    fmt_type = fmt.get("type")
+    if fmt_type == "json_schema":
+        json_schema = fmt.get("json_schema")
+        if isinstance(json_schema, dict):
+            normalized_json_schema = dict(json_schema)
+        else:
+            normalized_json_schema = {}
+            if fmt.get("name"):
+                normalized_json_schema["name"] = fmt.get("name")
+            if fmt.get("schema") is not None:
+                normalized_json_schema["schema"] = fmt.get("schema")
+            if "strict" in fmt:
+                normalized_json_schema["strict"] = fmt.get("strict")
+
+        if not isinstance(normalized_json_schema.get("schema"), dict):
+            logger.warning("dropping invalid json_schema response_format=%s", summarize_payload(fmt, limit=300))
+            return None
+
+        if not normalized_json_schema.get("name"):
+            normalized_json_schema["name"] = "structured_output"
+        if "strict" not in normalized_json_schema:
+            normalized_json_schema["strict"] = bool(fmt.get("strict", False))
+
+        return {
+            "type": "json_schema",
+            "json_schema": normalized_json_schema,
+        }
+
+    if fmt_type == "json_object":
+        return {"type": "json_object"}
+
+    if fmt_type == "text":
+        return {"type": "text"}
+
+    return None
+
+
+def get_tokenizer():
+    global TOKENIZER_LOAD_ATTEMPTED, TOKENIZER_LOAD_ERROR, TOKENIZER, TOKENIZER_MODE
+
+    if TOKENIZER_LOAD_ATTEMPTED:
+        return TOKENIZER
+
+    TOKENIZER_LOAD_ATTEMPTED = True
+    if not TOKENIZER_PATH:
+        TOKENIZER_MODE = "heuristic"
+        return None
+
+    try:
+        from transformers import AutoTokenizer
+
+        TOKENIZER = AutoTokenizer.from_pretrained(
+            TOKENIZER_PATH,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        TOKENIZER_MODE = f"transformers:{TOKENIZER_PATH}"
+        logger.info("loaded tokenizer for estimation path=%s", TOKENIZER_PATH)
+    except Exception as exc:
+        TOKENIZER = None
+        TOKENIZER_MODE = "heuristic"
+        TOKENIZER_LOAD_ERROR = f"{type(exc).__name__}: {exc}"
+        logger.warning("failed to load tokenizer path=%s error=%s; falling back to heuristic", TOKENIZER_PATH, TOKENIZER_LOAD_ERROR)
+
+    return TOKENIZER
+
+
+def estimate_token_count(text: str) -> int:
+    if not text:
+        return 0
+
+    tokenizer = get_tokenizer()
+    if tokenizer is not None:
+        try:
+            return len(tokenizer.encode(text, add_special_tokens=False))
+        except Exception:
+            pass
+
+    ascii_chars = 0
+    non_ascii_chars = 0
+    whitespace_chars = 0
+
+    for ch in text:
+        if ch.isspace():
+            whitespace_chars += 1
+        elif ord(ch) < 128:
+            ascii_chars += 1
+        else:
+            non_ascii_chars += 1
+
+    return non_ascii_chars + (ascii_chars + 3) // 4 + (whitespace_chars + 7) // 8
+
+
+def analyze_chat_body(chat_body: dict) -> dict:
+    messages = chat_body.get("messages") or []
+    tools = chat_body.get("tools") or []
+    multimodal_images = 0
+    text_chars = 0
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text_chars += len(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, str):
+                text_chars += len(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                multimodal_images += 1
+            text_chars += len(part.get("text") or "")
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                text_chars += len(image_url.get("url") or "")
+
+    serialized = json.dumps(chat_body, ensure_ascii=False)
+    serialized_chars = len(serialized)
+    estimated_tokens = estimate_token_count(serialized)
+
+    return {
+        "message_count": len(messages),
+        "tool_count": len(tools) if isinstance(tools, list) else 0,
+        "multimodal_image_count": multimodal_images,
+        "text_chars": text_chars,
+        "serialized_chars": serialized_chars,
+        "estimated_tokens": estimated_tokens,
+        "max_tokens": chat_body.get("max_tokens"),
+        "token_estimator": TOKENIZER_MODE,
+    }
+
+
+def truncate_text_middle(text: str, head_chars: int = TRUNCATED_TEXT_HEAD_CHARS, tail_chars: int = TRUNCATED_TEXT_TAIL_CHARS) -> str:
+    if len(text) <= head_chars + tail_chars + 64:
+        return text
+    return (
+        text[:head_chars]
+        + "\n...[truncated by glm-responses-proxy to fit model context]...\n"
+        + text[-tail_chars:]
+    )
+
+
+def trim_chat_body_to_context_limit(chat_body: dict, route: str) -> Tuple[dict, dict]:
+    messages = chat_body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return chat_body, {"trimmed": False}
+
+    trimmed_body = dict(chat_body)
+    trimmed_messages = [dict(message) if isinstance(message, dict) else message for message in messages]
+    trimmed_body["messages"] = trimmed_messages
+    removed_messages = 0
+    truncated_messages = 0
+
+    def stats() -> dict:
+        return analyze_chat_body(trimmed_body)
+
+    current_stats = stats()
+    if current_stats["estimated_tokens"] < CONTEXT_TOKEN_SOFT_LIMIT:
+        return trimmed_body, {
+            "trimmed": False,
+            "estimated_tokens": current_stats["estimated_tokens"],
+            "message_count": current_stats["message_count"],
+        }
+
+    removable_indexes = [
+        idx
+        for idx, message in enumerate(trimmed_messages)
+        if isinstance(message, dict) and message.get("role") != "system"
+    ]
+
+    while removable_indexes and current_stats["estimated_tokens"] >= CONTEXT_TOKEN_SOFT_LIMIT:
+        remove_index = removable_indexes.pop(0)
+        trimmed_messages.pop(remove_index)
+        removed_messages += 1
+        removable_indexes = [
+            idx
+            for idx, message in enumerate(trimmed_messages)
+            if isinstance(message, dict) and message.get("role") != "system"
+        ]
+        current_stats = stats()
+
+    if current_stats["estimated_tokens"] >= CONTEXT_TOKEN_SOFT_LIMIT:
+        for message in trimmed_messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and len(content) > TRUNCATED_TEXT_HEAD_CHARS + TRUNCATED_TEXT_TAIL_CHARS + 64:
+                new_content = truncate_text_middle(content)
+                if new_content != content:
+                    message["content"] = new_content
+                    truncated_messages += 1
+                    current_stats = stats()
+                    if current_stats["estimated_tokens"] < CONTEXT_TOKEN_SOFT_LIMIT:
+                        break
+
+    trim_info = {
+        "trimmed": removed_messages > 0 or truncated_messages > 0,
+        "removed_messages": removed_messages,
+        "truncated_messages": truncated_messages,
+        "estimated_tokens": current_stats["estimated_tokens"],
+        "message_count": current_stats["message_count"],
+        "serialized_chars": current_stats["serialized_chars"],
+    }
+
+    if trim_info["trimmed"]:
+        logger.warning(
+            "%s context trimmed removed_messages=%s truncated_messages=%s estimated_tokens=%s estimator=%s message_count=%s serialized_chars=%s",
+            route,
+            removed_messages,
+            truncated_messages,
+            current_stats["estimated_tokens"],
+            current_stats["token_estimator"],
+            current_stats["message_count"],
+            current_stats["serialized_chars"],
+        )
+
+    return trimmed_body, trim_info
+
+
+def reject_if_context_too_large(route: str, chat_body: dict) -> Optional[JSONResponse]:
+    stats = analyze_chat_body(chat_body)
+    estimated_tokens = stats["estimated_tokens"]
+
+    if estimated_tokens >= CONTEXT_TOKEN_SOFT_LIMIT:
+        logger.warning(
+            "%s large context estimated_tokens=%s estimator=%s messages=%s tools=%s images=%s serialized_chars=%s max_tokens=%s",
+            route,
+            estimated_tokens,
+            stats["token_estimator"],
+            stats["message_count"],
+            stats["tool_count"],
+            stats["multimodal_image_count"],
+            stats["serialized_chars"],
+            stats["max_tokens"],
+        )
+
+    if estimated_tokens < CONTEXT_TOKEN_HARD_LIMIT:
+        return None
+
+    return json_error(
+        message=(
+            "请求上下文过大，代理估算输入约为 "
+            f"{estimated_tokens} tokens，已接近或超过安全上限 {CONTEXT_TOKEN_HARD_LIMIT}。"
+            "请缩短 system prompt、减少历史消息，或先对旧上下文做摘要后再重试。"
+        ),
+        status_code=400,
+        error_type="invalid_request_error",
+        code="context_length_exceeded",
+    )
+
+
+def format_message_for_summary(message: dict) -> str:
+    role = message.get("role", "user")
+    content = message.get("content")
+    tool_call_id = message.get("tool_call_id")
+
+    if isinstance(content, str):
+        text = content
+    else:
+        text = extract_text_content(content)
+
+    text = truncate_text_middle(text, head_chars=6000, tail_chars=6000)
+    prefix = f"{role.upper()}: "
+    if role == "tool" and tool_call_id:
+        prefix = f"TOOL[{tool_call_id}]: "
+    return prefix + text
+
+
+def build_summary_candidate_indexes(messages: List[dict]) -> List[int]:
+    non_system_indexes = [
+        idx for idx, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") != "system"
+    ]
+    if len(non_system_indexes) <= SUMMARY_KEEP_RECENT_MESSAGES:
+        return []
+    return non_system_indexes[:-SUMMARY_KEEP_RECENT_MESSAGES]
+
+
+def build_summary_transcript(messages: List[dict], candidate_indexes: List[int]) -> str:
+    parts = []
+    current_chars = 0
+
+    for idx in candidate_indexes:
+        message = messages[idx]
+        if not isinstance(message, dict):
+            continue
+        part = format_message_for_summary(message)
+        next_chars = current_chars + len(part) + 2
+        if next_chars > SUMMARY_TRANSCRIPT_MAX_CHARS and parts:
+            break
+        parts.append(part)
+        current_chars = next_chars
+
+    return "\n\n".join(parts)
+
+
+async def summarize_old_messages(
+    route: str,
+    chat_body: dict,
+    headers: dict,
+) -> Tuple[dict, dict]:
+    messages = chat_body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return chat_body, {"summarized": False}
+
+    current_stats = analyze_chat_body(chat_body)
+    if current_stats["estimated_tokens"] < SUMMARY_TRIGGER_TOKENS:
+        return chat_body, {"summarized": False, "estimated_tokens": current_stats["estimated_tokens"]}
+
+    candidate_indexes = build_summary_candidate_indexes(messages)
+    if not candidate_indexes:
+        return chat_body, {"summarized": False, "estimated_tokens": current_stats["estimated_tokens"]}
+
+    transcript = build_summary_transcript(messages, candidate_indexes)
+    if not transcript.strip():
+        return chat_body, {"summarized": False, "estimated_tokens": current_stats["estimated_tokens"]}
+
+    upstream_base_url, selected_model = select_upstream(chat_body)
+    summary_request = {
+        "model": selected_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize earlier conversation history for continued coding work. "
+                    "Preserve user goals, constraints, decisions, file paths, unresolved issues, "
+                    "tool results, and any concrete next steps. Be concise but complete."
+                ),
+            },
+            {
+                "role": "user",
+                "content": transcript,
+            },
+        ],
+        "temperature": 0.2,
+        "max_tokens": SUMMARY_TARGET_MAX_TOKENS,
+        "stream": False,
+    }
+
+    logger.warning(
+        "%s context summary start estimated_tokens=%s estimator=%s candidate_messages=%s transcript_chars=%s",
+        route,
+        current_stats["estimated_tokens"],
+        current_stats["token_estimator"],
+        len(candidate_indexes),
+        len(transcript),
+    )
+
+    try:
+        resp = await get_client().post(
+            f"{upstream_base_url}/chat/completions",
+            json=summary_request,
+            headers=headers,
+        )
+        if resp.status_code >= 400:
+            logger.warning("%s context summary failed status=%s body=%s", route, resp.status_code, resp.text[:800])
+            return chat_body, {
+                "summarized": False,
+                "estimated_tokens": current_stats["estimated_tokens"],
+                "summary_error": f"http_{resp.status_code}",
+            }
+
+        payload = resp.json()
+        choices = payload.get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        summary_text = extract_text_content(message.get("content"))
+        summary_text = (summary_text or "").strip()
+        if not summary_text:
+            logger.warning("%s context summary returned empty output", route)
+            return chat_body, {
+                "summarized": False,
+                "estimated_tokens": current_stats["estimated_tokens"],
+                "summary_error": "empty_summary",
+            }
+
+        summarized_body = dict(chat_body)
+        new_messages: List[dict] = []
+        insert_at = candidate_indexes[0]
+        kept_recent = [
+            msg for idx, msg in enumerate(messages)
+            if idx not in set(candidate_indexes)
+        ]
+
+        for idx, message in enumerate(messages):
+            if idx == insert_at:
+                new_messages.append(
+                    {
+                        "role": "system",
+                        "content": SUMMARY_MESSAGE_PREFIX + summary_text,
+                    }
+                )
+            if idx in candidate_indexes:
+                continue
+            new_messages.append(message)
+
+        summarized_body["messages"] = new_messages
+        summarized_stats = analyze_chat_body(summarized_body)
+        logger.warning(
+            "%s context summary applied removed_messages=%s estimated_tokens_before=%s estimated_tokens_after=%s summary_len=%s kept_recent=%s",
+            route,
+            len(candidate_indexes),
+            current_stats["estimated_tokens"],
+            summarized_stats["estimated_tokens"],
+            len(summary_text),
+            len(kept_recent),
+        )
+        return summarized_body, {
+            "summarized": True,
+            "removed_messages": len(candidate_indexes),
+            "summary_length": len(summary_text),
+            "estimated_tokens_before": current_stats["estimated_tokens"],
+            "estimated_tokens_after": summarized_stats["estimated_tokens"],
+        }
+    except Exception as exc:
+        logger.exception("%s context summary exception", route)
+        return chat_body, {
+            "summarized": False,
+            "estimated_tokens": current_stats["estimated_tokens"],
+            "summary_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+async def prepare_chat_body_for_upstream(route: str, chat_body: dict, headers: dict) -> Tuple[dict, Optional[JSONResponse], dict]:
+    prepared_body, docx_info = inject_docx_context(chat_body, route)
+    initial_stats = analyze_chat_body(prepared_body)
+    summary_info = {"summarized": False}
+
+    if initial_stats["estimated_tokens"] >= SUMMARY_TRIGGER_TOKENS:
+        prepared_body, summary_info = await summarize_old_messages(route, prepared_body, headers)
+
+    prepared_body, trim_info = trim_chat_body_to_context_limit(prepared_body, route)
+    rejection = reject_if_context_too_large(route, prepared_body)
+    final_stats = analyze_chat_body(prepared_body)
+
+    return prepared_body, rejection, {
+        "initial_stats": initial_stats,
+        "docx_info": docx_info,
+        "summary_info": summary_info,
+        "trim_info": trim_info,
+        "final_stats": final_stats,
+    }
+
+
+def usage_to_stats(usage: Optional[dict]) -> Tuple[int, int]:
+    if not isinstance(usage, dict):
+        return 0, 0
+    return (
+        int(usage.get("prompt_tokens", 0) or 0),
+        int(usage.get("completion_tokens", 0) or 0),
+    )
 
 
 @asynccontextmanager
@@ -367,10 +855,49 @@ def stringify_tool_output(output: Any) -> str:
     return json.dumps(output, ensure_ascii=False)
 
 
+def summarize_tool_output_for_context(output: Any, tool_name: str = "") -> str:
+    text = stringify_tool_output(output)
+    if len(text) <= TOOL_OUTPUT_MAX_CHARS:
+        return text
+
+    stripped = text.lstrip()
+    looks_like_json = stripped.startswith("{") or stripped.startswith("[")
+    line_count = text.count("\n") + 1 if text else 0
+    summary_parts = [
+        f"tool={tool_name or 'unknown'}",
+        f"chars={len(text)}",
+        f"lines={line_count}",
+        f"looks_like_json={'yes' if looks_like_json else 'no'}",
+    ]
+
+    if tool_name == "shell_command":
+        summary_parts.append("truncated_by=glm-responses-proxy")
+
+    logger.info(
+        "truncated tool output for context tool=%s chars=%s lines=%s looks_like_json=%s",
+        tool_name or "unknown",
+        len(text),
+        line_count,
+        looks_like_json,
+    )
+
+    return (
+        "[tool output truncated for context preservation]\n"
+        + "summary: "
+        + ", ".join(summary_parts)
+        + "\n"
+        + "head:\n"
+        + text[:TOOL_OUTPUT_HEAD_CHARS]
+        + "\n...[truncated by glm-responses-proxy]...\n"
+        + "tail:\n"
+        + text[-TOOL_OUTPUT_TAIL_CHARS:]
+    )
+
+
 def map_response_format(request_body: dict) -> Optional[dict]:
     response_format = request_body.get("response_format")
     if isinstance(response_format, dict):
-        return response_format
+        return normalize_response_format_for_upstream(response_format)
 
     text_config = request_body.get("text")
     if not isinstance(text_config, dict):
@@ -379,12 +906,171 @@ def map_response_format(request_body: dict) -> Optional[dict]:
     fmt = text_config.get("format")
     if not isinstance(fmt, dict):
         return None
+    return normalize_response_format_for_upstream(fmt)
 
-    fmt_type = fmt.get("type")
-    if fmt_type in ("json_object", "json_schema", "text"):
-        return fmt
 
-    return None
+def extract_docx_text(path: str, max_chars: int = DOCX_EXTRACT_MAX_CHARS) -> Optional[str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml = archive.read("word/document.xml")
+    except Exception:
+        return None
+
+    try:
+        root = ET.fromstring(xml)
+    except Exception:
+        return None
+
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    parts: List[str] = []
+    total_chars = 0
+
+    for paragraph in root.findall(".//w:p", ns):
+        runs = [node.text or "" for node in paragraph.findall(".//w:t", ns)]
+        line = "".join(runs).strip()
+        if not line:
+            continue
+        next_total = total_chars + len(line) + 1
+        if next_total > max_chars and parts:
+            parts.append("...[docx content truncated by glm-responses-proxy]...")
+            break
+        parts.append(line)
+        total_chars = next_total
+
+    if not parts:
+        return None
+
+    return "\n".join(parts)
+
+
+def should_attempt_docx_discovery(messages: List[dict]) -> bool:
+    joined_parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        joined_parts.append(extract_text_content(message.get("content")))
+    joined = "\n".join(part for part in joined_parts if part).lower()
+    if ".docx" in joined:
+        return True
+    return any(keyword in joined for keyword in ("阅读文档", "word文档", "ppt大纲", "md文档", "markdown"))
+
+
+def discover_nearby_docx_candidates() -> List[str]:
+    cwd = os.getcwd()
+    roots = [cwd, os.path.dirname(cwd)]
+    found = []
+    seen = set()
+
+    for root in roots:
+        for current_root, dirs, files in os.walk(root):
+            rel = os.path.relpath(current_root, root)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if depth > DOCX_DISCOVERY_MAX_DEPTH:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if d not in {".git", ".run", "__pycache__"}]
+            for filename in files:
+                if not filename.lower().endswith(".docx"):
+                    continue
+                path = os.path.join(current_root, filename)
+                if path in seen:
+                    continue
+                seen.add(path)
+                found.append(path)
+                if len(found) >= DOCX_DISCOVERY_MAX_CANDIDATES:
+                    return found
+    return found
+
+
+def inject_docx_context(chat_body: dict, route: str) -> Tuple[dict, dict]:
+    messages = chat_body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return chat_body, {"injected": False}
+
+    seen_paths = set()
+    extracted_docs = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        text = content if isinstance(content, str) else extract_text_content(content)
+        if not text:
+            continue
+
+        for match in DOCX_PATH_PATTERN.finditer(text):
+            raw_path = match.group("path")
+            path = os.path.abspath(os.path.expanduser(raw_path))
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if not os.path.isfile(path):
+                continue
+            extracted = extract_docx_text(path)
+            if not extracted:
+                continue
+            extracted_docs.append((path, extracted))
+
+        for match in DOCX_NAME_PATTERN.finditer(text):
+            raw_name = match.group("name")
+            path = os.path.abspath(os.path.expanduser(raw_name))
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if not os.path.isfile(path):
+                continue
+            extracted = extract_docx_text(path)
+            if not extracted:
+                continue
+            extracted_docs.append((path, extracted))
+
+    if not extracted_docs and should_attempt_docx_discovery(messages):
+        nearby_candidates = discover_nearby_docx_candidates()
+        if len(nearby_candidates) == 1:
+            path = nearby_candidates[0]
+            extracted = extract_docx_text(path)
+            if extracted:
+                extracted_docs.append((path, extracted))
+        elif len(nearby_candidates) > 1:
+            logger.info("%s skipped automatic docx discovery candidate_count=%s", route, len(nearby_candidates))
+
+    if not extracted_docs:
+        return chat_body, {"injected": False}
+
+    augmented_body = dict(chat_body)
+    augmented_messages = list(messages)
+    insert_index = 0
+    if augmented_messages and isinstance(augmented_messages[0], dict) and augmented_messages[0].get("role") == "system":
+        insert_index = 1
+
+    injected_messages = []
+    for path, extracted in extracted_docs:
+        injected_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "The following DOCX file has been pre-extracted for you. "
+                    "Use this text instead of attempting to read the binary .docx directly.\n"
+                    f"Source: {path}\n"
+                    "Extracted content:\n"
+                    f"{extracted}"
+                ),
+            }
+        )
+
+    augmented_messages[insert_index:insert_index] = injected_messages
+    augmented_body["messages"] = augmented_messages
+    logger.info(
+        "%s injected_docx_context files=%s chars=%s",
+        route,
+        len(extracted_docs),
+        sum(len(text) for _, text in extracted_docs),
+    )
+    return augmented_body, {
+        "injected": True,
+        "files": [path for path, _ in extracted_docs],
+        "chars": sum(len(text) for _, text in extracted_docs),
+    }
 
 
 def get_requested_text_format(request_body: dict) -> Optional[dict]:
@@ -605,6 +1291,8 @@ def convert_responses_to_chat(request_body: dict) -> dict:
     把 /v1/responses 请求体转换成 /v1/chat/completions 请求体。
     """
     messages = []
+    known_tool_calls: Dict[str, dict] = {}
+    saw_aborted_apply_patch = False
 
     instructions = request_body.get("instructions")
     if instructions:
@@ -661,16 +1349,49 @@ def convert_responses_to_chat(request_body: dict) -> dict:
                     }
                 )
 
+            elif item_type == "function_call":
+                call_id = item.get("call_id") or f"call_{uuid.uuid4().hex}"
+                name = item.get("name") or ""
+                arguments = item.get("arguments") or ""
+                known_tool_calls[call_id] = {
+                    "name": name,
+                    "arguments": arguments,
+                }
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    }
+                )
+
             # Codex / Responses 里可能有 function_call_output
-            # 这里先作为 user 文本塞回去，避免完全丢上下文
             elif item_type == "function_call_output":
                 output = item.get("output", "")
                 call_id = item.get("call_id", "")
+                tool_name = (known_tool_calls.get(call_id) or {}).get("name") or ""
+                content = summarize_tool_output_for_context(output, tool_name=tool_name)
+                if content.strip().lower() == "aborted" and tool_name == "apply_patch":
+                    saw_aborted_apply_patch = True
+                    content = (
+                        "Tool execution aborted by client while running apply_patch. "
+                        "Do not retry the same patch unchanged. If file writing is unavailable, "
+                        "explain the failure briefly or provide the markdown/text result directly."
+                    )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": stringify_tool_output(output),
+                        "content": content,
                     }
                 )
 
@@ -679,6 +1400,18 @@ def convert_responses_to_chat(request_body: dict) -> dict:
             {
                 "role": "user",
                 "content": str(input_data),
+            }
+        )
+
+    if saw_aborted_apply_patch:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "A recent apply_patch call was aborted by the client. "
+                    "Prefer a single revised patch or a direct textual result instead of "
+                    "repeatedly retrying similar patches."
+                ),
             }
         )
 
@@ -819,7 +1552,12 @@ def convert_chat_to_responses(chat_response: dict, text_format: Optional[dict] =
     }
 
 
-async def responses_stream_generator(chat_body: dict, headers: dict, text_format: Optional[dict] = None):
+async def responses_stream_generator(
+    chat_body: dict,
+    headers: dict,
+    text_format: Optional[dict] = None,
+    stream_metrics: Optional[dict] = None,
+):
     """
     把 vLLM 的 Chat Completions 流式输出转换成 Responses API 风格 SSE。
     所有退出路径都尽量发送 data: [DONE]。
@@ -1104,6 +1842,8 @@ async def responses_stream_generator(chat_body: dict, headers: dict, text_format
         ) as resp:
 
             if resp.status_code in (401, 403):
+                if stream_metrics is not None:
+                    stream_metrics["error"] = True
                 logger.warning("responses stream upstream auth failed status=%s", resp.status_code)
                 yield error_sse(
                     "API key 不正确，vLLM 验证未通过",
@@ -1116,6 +1856,8 @@ async def responses_stream_generator(chat_body: dict, headers: dict, text_format
             if resp.status_code >= 400:
                 error_bytes = await resp.aread()
                 error_text = error_bytes.decode("utf-8", errors="ignore")
+                if stream_metrics is not None:
+                    stream_metrics["error"] = True
                 logger.warning(
                     "responses stream upstream error status=%s body=%s",
                     resp.status_code,
@@ -1380,11 +2122,19 @@ async def responses_stream_generator(chat_body: dict, headers: dict, text_format
             len(full_text),
             len(reasoning_text),
         )
+        if stream_metrics is not None:
+            stream_metrics["usage"] = {
+                "prompt_tokens": final_usage["input_tokens"],
+                "completion_tokens": final_usage["output_tokens"],
+                "total_tokens": final_usage["total_tokens"],
+            }
 
         yield done_event()
         done_sent = True
 
     except Exception as e:
+        if stream_metrics is not None:
+            stream_metrics["error"] = True
         logger.exception("responses stream proxy error")
         yield error_sse(str(e), "proxy_error")
         try:
@@ -1435,26 +2185,49 @@ async def responses_proxy(request: Request):
     )
     capture_request("/v1/responses", dict(request.headers), body)
     chat_body = convert_responses_to_chat(body)
+    chat_body, context_rejection, prep_info = await prepare_chat_body_for_upstream("/v1/responses", chat_body, headers)
+    logger.info(
+        "responses context prep initial_tokens=%s final_tokens=%s estimator=%s docx_injected=%s summarized=%s trimmed=%s",
+        prep_info["initial_stats"]["estimated_tokens"],
+        prep_info["final_stats"]["estimated_tokens"],
+        prep_info["final_stats"]["token_estimator"],
+        prep_info["docx_info"].get("injected", False),
+        prep_info["summary_info"].get("summarized", False),
+        prep_info["trim_info"].get("trimmed", False),
+    )
+    if context_rejection is not None:
+        traffic_stats.record(
+            endpoint="/v1/responses",
+            request_bytes=len(json.dumps(chat_body, ensure_ascii=False).encode("utf-8")),
+            error=True,
+        )
+        return context_rejection
     stream = chat_body.get("stream", False)
     text_format = get_requested_text_format(body)
 
     if stream:
         upstream_base_url, selected_model = select_upstream(chat_body)
         chat_body["model"] = selected_model
+        stream_metrics = {"usage": None, "error": False}
 
         async def tracked_responses_stream():
             total_bytes = 0
-            async for chunk in responses_stream_generator(chat_body, headers, text_format=text_format):
+            async for chunk in responses_stream_generator(
+                chat_body,
+                headers,
+                text_format=text_format,
+                stream_metrics=stream_metrics,
+            ):
                 total_bytes += len(chunk) if isinstance(chunk, (bytes, bytearray)) else len(chunk.encode("utf-8")) if isinstance(chunk, str) else 0
                 yield chunk
+            input_tokens, output_tokens = usage_to_stats(stream_metrics.get("usage"))
             traffic_stats.record(
-                route="/v1/responses",
-                stream=True,
-                upstream=upstream_base_url,
-                model=selected_model,
-                req_bytes=len(json.dumps(chat_body).encode("utf-8")),
-                resp_bytes=total_bytes,
-                usage=None,
+                endpoint="/v1/responses",
+                request_bytes=len(json.dumps(chat_body, ensure_ascii=False).encode("utf-8")),
+                response_bytes=total_bytes,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                error=bool(stream_metrics.get("error")),
             )
 
         return StreamingResponse(
@@ -1478,9 +2251,21 @@ async def responses_proxy(request: Request):
     logger.info("responses non-stream upstream=%s status=%s", upstream_base_url, resp.status_code)
 
     if resp.status_code in (401, 403):
+        traffic_stats.record(
+            endpoint="/v1/responses",
+            request_bytes=len(json.dumps(chat_body, ensure_ascii=False).encode("utf-8")),
+            response_bytes=len(resp.content),
+            error=True,
+        )
         return key_error_response(resp.status_code)
 
     if resp.status_code >= 400:
+        traffic_stats.record(
+            endpoint="/v1/responses",
+            request_bytes=len(json.dumps(chat_body, ensure_ascii=False).encode("utf-8")),
+            response_bytes=len(resp.content),
+            error=True,
+        )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -1490,14 +2275,13 @@ async def responses_proxy(request: Request):
     chat_data = resp.json()
     logger.debug("responses non-stream upstream body=%s", summarize_payload(chat_data))
     responses_result = convert_chat_to_responses(chat_data, text_format=text_format)
+    input_tokens, output_tokens = usage_to_stats(chat_data.get("usage"))
     traffic_stats.record(
-        route="/v1/responses",
-        stream=False,
-        upstream=upstream_base_url,
-        model=selected_model,
-        req_bytes=len(await request.body()) if hasattr(request, '_body') else 0,
-        resp_bytes=len(resp.content),
-        usage=chat_data.get("usage"),
+        endpoint="/v1/responses",
+        request_bytes=len(json.dumps(chat_body, ensure_ascii=False).encode("utf-8")),
+        response_bytes=len(resp.content),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
     return responses_result
 
@@ -1524,8 +2308,18 @@ async def models(request: Request):
         logger.info("models upstream=%s status=%s", upstream_url, resp.status_code)
 
         if resp.status_code in (401, 403):
+            traffic_stats.record(
+                endpoint="/v1/models",
+                response_bytes=len(resp.content),
+                error=True,
+            )
             return key_error_response(resp.status_code)
         if resp.status_code >= 400:
+            traffic_stats.record(
+                endpoint="/v1/models",
+                response_bytes=len(resp.content),
+                error=True,
+            )
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -1538,6 +2332,8 @@ async def models(request: Request):
             if model_id and model_id not in seen_ids:
                 seen_ids.add(model_id)
                 merged.append(item)
+
+    traffic_stats.record(endpoint="/v1/models", response_bytes=len(json.dumps(merged, ensure_ascii=False).encode("utf-8")))
 
     return {
         "object": "list",
@@ -1571,6 +2367,23 @@ async def chat_proxy(request: Request):
         summarize_payload(body),
     )
     capture_request("/v1/chat/completions", dict(request.headers), body)
+    body, context_rejection, prep_info = await prepare_chat_body_for_upstream("/v1/chat/completions", body, headers)
+    logger.info(
+        "chat context prep initial_tokens=%s final_tokens=%s estimator=%s docx_injected=%s summarized=%s trimmed=%s",
+        prep_info["initial_stats"]["estimated_tokens"],
+        prep_info["final_stats"]["estimated_tokens"],
+        prep_info["final_stats"]["token_estimator"],
+        prep_info["docx_info"].get("injected", False),
+        prep_info["summary_info"].get("summarized", False),
+        prep_info["trim_info"].get("trimmed", False),
+    )
+    if context_rejection is not None:
+        traffic_stats.record(
+            endpoint="/v1/chat/completions",
+            request_bytes=len(json.dumps(body, ensure_ascii=False).encode("utf-8")),
+            error=True,
+        )
+        return context_rejection
 
     # 非流式 chat 代理
     if not body.get("stream", False):
@@ -1582,16 +2395,22 @@ async def chat_proxy(request: Request):
         logger.info("chat non-stream upstream=%s status=%s", upstream_base_url, resp.status_code)
 
         if resp.status_code in (401, 403):
+            traffic_stats.record(
+                endpoint="/v1/chat/completions",
+                request_bytes=len(json.dumps(body, ensure_ascii=False).encode("utf-8")),
+                response_bytes=len(resp.content),
+                error=True,
+            )
             return key_error_response(resp.status_code)
 
+        input_tokens, output_tokens = usage_to_stats(resp.json().get("usage")) if resp.status_code < 400 else (0, 0)
         traffic_stats.record(
-            route="/v1/chat/completions",
-            stream=False,
-            upstream=upstream_base_url,
-            model=selected_model,
-            req_bytes=len(json.dumps(body).encode("utf-8")),
-            resp_bytes=len(resp.content),
-            usage=None,
+            endpoint="/v1/chat/completions",
+            request_bytes=len(json.dumps(body, ensure_ascii=False).encode("utf-8")),
+            response_bytes=len(resp.content),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            error=resp.status_code >= 400,
         )
         return Response(
             content=resp.content,
@@ -1620,6 +2439,7 @@ async def chat_proxy(request: Request):
             ) as resp:
 
                 if resp.status_code in (401, 403):
+                    stream_metrics["error"] = True
                     logger.warning("chat stream upstream auth failed status=%s", resp.status_code)
                     error_data = {
                         "error": {
@@ -1636,6 +2456,7 @@ async def chat_proxy(request: Request):
                 if resp.status_code >= 400:
                     error_bytes = await resp.aread()
                     error_text = error_bytes.decode("utf-8", errors="ignore")
+                    stream_metrics["error"] = True
                     logger.warning(
                         "chat stream upstream error status=%s body=%s",
                         resp.status_code,
@@ -1669,6 +2490,7 @@ async def chat_proxy(request: Request):
                 logger.info("chat stream completed saw_done_from_vllm=%s", saw_done_from_vllm)
 
         except Exception as e:
+            stream_metrics["error"] = True
             logger.exception("chat stream proxy error")
             error_data = {
                 "error": {
@@ -1682,19 +2504,18 @@ async def chat_proxy(request: Request):
                 yield chat_done()
                 done_sent = True
 
+    stream_metrics = {"error": False}
+
     async def tracked_chat_stream():
         total_bytes = 0
         async for chunk in chat_stream_generator():
             total_bytes += len(chunk) if isinstance(chunk, (bytes, bytearray)) else 0
             yield chunk
         traffic_stats.record(
-            route="/v1/chat/completions",
-            stream=True,
-            upstream=upstream_base_url,
-            model=selected_model,
-            req_bytes=len(json.dumps(body).encode("utf-8")),
-            resp_bytes=total_bytes,
-            usage=None,
+            endpoint="/v1/chat/completions",
+            request_bytes=len(json.dumps(body, ensure_ascii=False).encode("utf-8")),
+            response_bytes=total_bytes,
+            error=bool(stream_metrics.get("error")),
         )
 
     return StreamingResponse(
@@ -1727,17 +2548,18 @@ async def root():
 
 
 def main(argv: Optional[List[str]] = None):
-    global VLLM_BASE_URL, GLM_MODEL_NAME, MULTIMODAL_BASE_URL, MULTIMODAL_MODEL_NAME
+    global VLLM_BASE_URL, GLM_MODEL_NAME, MULTIMODAL_BASE_URL, MULTIMODAL_MODEL_NAME, TOKENIZER_PATH
 
     args = parse_args(argv)
     VLLM_BASE_URL = args.base_url.rstrip("/")
     GLM_MODEL_NAME = args.model
     MULTIMODAL_BASE_URL = args.multimodal_base_url.rstrip("/") if args.multimodal_base_url else ""
     MULTIMODAL_MODEL_NAME = args.multimodal_model
+    TOKENIZER_PATH = args.tokenizer or ""
     set_capture_log(args.capture_log)
     configure_logging("DEBUG" if args.debug else args.log_level)
     logger.info(
-        "starting proxy upstream=%s text_model=%s multimodal_upstream=%s multimodal_model=%s host=%s port=%s level=%s",
+        "starting proxy upstream=%s text_model=%s multimodal_upstream=%s multimodal_model=%s host=%s port=%s level=%s tokenizer=%s",
         VLLM_BASE_URL,
         GLM_MODEL_NAME,
         MULTIMODAL_BASE_URL or None,
@@ -1745,6 +2567,7 @@ def main(argv: Optional[List[str]] = None):
         args.host,
         args.port,
         "DEBUG" if args.debug else args.log_level.upper(),
+        TOKENIZER_PATH or None,
     )
     if REQUEST_CAPTURE_LOG:
         logger.info("request capture log=%s", REQUEST_CAPTURE_LOG)

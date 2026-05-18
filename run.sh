@@ -24,6 +24,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 DEBUG="${DEBUG:-0}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 
 usage() {
   cat <<EOF
@@ -37,6 +38,7 @@ Defaults:
   MULTIMODAL_MODEL=$MULTIMODAL_MODEL
   HOST=$HOST
   PORT=$PORT
+  TOKENIZER_PATH=$TOKENIZER_PATH
   CAPTURE_LOG_FILE=$CAPTURE_LOG_FILE
 EOF
 }
@@ -69,6 +71,7 @@ start() {
     --port "$PORT"
     --log-level "$LOG_LEVEL"
   )
+  [ -n "$TOKENIZER_PATH" ] && cmd+=(--tokenizer "$TOKENIZER_PATH")
   [ -n "$capture_log" ] && cmd+=(--capture-log "$capture_log")
   [ "$DEBUG" = "1" ] && cmd+=(--debug)
 
