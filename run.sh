@@ -25,6 +25,7 @@ PORT="${PORT:-8080}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 DEBUG="${DEBUG:-0}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-}"
+DOCX_AUTO_DISCOVERY_ENABLED="${DOCX_AUTO_DISCOVERY_ENABLED:-0}"
 
 usage() {
   cat <<EOF
@@ -39,6 +40,7 @@ Defaults:
   HOST=$HOST
   PORT=$PORT
   TOKENIZER_PATH=$TOKENIZER_PATH
+  DOCX_AUTO_DISCOVERY_ENABLED=$DOCX_AUTO_DISCOVERY_ENABLED
   CAPTURE_LOG_FILE=$CAPTURE_LOG_FILE
 EOF
 }
@@ -72,6 +74,7 @@ start() {
     --log-level "$LOG_LEVEL"
   )
   [ -n "$TOKENIZER_PATH" ] && cmd+=(--tokenizer "$TOKENIZER_PATH")
+  export DOCX_AUTO_DISCOVERY_ENABLED
   [ -n "$capture_log" ] && cmd+=(--capture-log "$capture_log")
   [ "$DEBUG" = "1" ] && cmd+=(--debug)
 

@@ -47,12 +47,21 @@ TOOL_OUTPUT_TAIL_CHARS = 2000
 DOCX_EXTRACT_MAX_CHARS = 16000
 DOCX_DISCOVERY_MAX_DEPTH = 2
 DOCX_DISCOVERY_MAX_CANDIDATES = 12
+DOCX_AUTO_DISCOVERY_ENABLED = os.environ.get("DOCX_AUTO_DISCOVERY_ENABLED", "0") == "1"
 TOKENIZER_LOAD_ATTEMPTED = False
 TOKENIZER_LOAD_ERROR = ""
 TOKENIZER = None
 TOKENIZER_MODE = "heuristic"
 DOCX_PATH_PATTERN = re.compile(r"(?P<path>(?:/|\.?/)?[^\s\"'<>]+\.docx)\b", re.IGNORECASE)
-DOCX_NAME_PATTERN = re.compile(r"(?P<name>[^\s/\"'<>]+\.docx)\b", re.IGNORECASE)
+WINDOWS_ABS_FILE_PATTERN = re.compile(
+    r"(?P<path>[A-Za-z]:[\\/][^\n\r\t<>|]+?\.[A-Za-z0-9]{1,16})"
+)
+POSIX_ABS_FILE_PATTERN = re.compile(
+    r"(?P<path>/(?:[^\s\]\[()<>])+?(?:/[^\s\]\[()<>]+)*\.[A-Za-z0-9]{1,16})"
+)
+MARKDOWN_LINK_PATTERN = re.compile(
+    r"\[[^\]]+\]\((?P<target><[^>\n]+>|[^)\n]+)\)"
+)
 
 
 def parse_args(argv: Optional[List[str]] = None):
@@ -1000,7 +1009,10 @@ def inject_docx_context(chat_body: dict, route: str) -> Tuple[dict, dict]:
 
         for match in DOCX_PATH_PATTERN.finditer(text):
             raw_path = match.group("path")
-            path = os.path.abspath(os.path.expanduser(raw_path))
+            expanded_path = os.path.expanduser(raw_path)
+            if not os.path.isabs(expanded_path):
+                continue
+            path = os.path.abspath(expanded_path)
             if path in seen_paths:
                 continue
             seen_paths.add(path)
@@ -1011,20 +1023,7 @@ def inject_docx_context(chat_body: dict, route: str) -> Tuple[dict, dict]:
                 continue
             extracted_docs.append((path, extracted))
 
-        for match in DOCX_NAME_PATTERN.finditer(text):
-            raw_name = match.group("name")
-            path = os.path.abspath(os.path.expanduser(raw_name))
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
-            if not os.path.isfile(path):
-                continue
-            extracted = extract_docx_text(path)
-            if not extracted:
-                continue
-            extracted_docs.append((path, extracted))
-
-    if not extracted_docs and should_attempt_docx_discovery(messages):
+    if not extracted_docs and DOCX_AUTO_DISCOVERY_ENABLED and should_attempt_docx_discovery(messages):
         nearby_candidates = discover_nearby_docx_candidates()
         if len(nearby_candidates) == 1:
             path = nearby_candidates[0]
@@ -1119,6 +1118,71 @@ def normalize_structured_output_text(text: str, text_format: Optional[dict]) -> 
     return json.dumps({key: value}, ensure_ascii=False)
 
 
+def _path_to_markdown_link(path: str) -> str:
+    normalized_path = path.replace("\\", "/")
+    label = os.path.basename(normalized_path.rstrip("/")) or normalized_path
+    target = normalized_path
+    if " " in target:
+        return f"[{label}](<{target}>)"
+    return f"[{label}]({target})"
+
+
+def _collect_markdown_target_ranges(text: str) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    for match in MARKDOWN_LINK_PATTERN.finditer(text):
+        target = match.group("target")
+        if not target:
+            continue
+        start = match.start("target")
+        end = match.end("target")
+        if target.startswith("<") and target.endswith(">") and end - start >= 2:
+            start += 1
+            end -= 1
+        ranges.append((start, end))
+    return ranges
+
+
+def _range_is_protected(start: int, end: int, protected_ranges: List[Tuple[int, int]]) -> bool:
+    for protected_start, protected_end in protected_ranges:
+        if start >= protected_start and end <= protected_end:
+            return True
+    return False
+
+
+def inject_markdown_file_links(text: str) -> str:
+    if not text:
+        return text
+
+    protected_ranges = _collect_markdown_target_ranges(text)
+    matches: List[Tuple[int, int, str]] = []
+    patterns = (WINDOWS_ABS_FILE_PATTERN, POSIX_ABS_FILE_PATTERN)
+
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            start = match.start("path")
+            end = match.end("path")
+            if _range_is_protected(start, end, protected_ranges):
+                continue
+            matches.append((start, end, match.group("path")))
+
+    if not matches:
+        return text
+
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    output_parts: List[str] = []
+    cursor = 0
+
+    for start, end, path in matches:
+        if start < cursor:
+            continue
+        output_parts.append(text[cursor:start])
+        output_parts.append(_path_to_markdown_link(path))
+        cursor = end
+
+    output_parts.append(text[cursor:])
+    return "".join(output_parts)
+
+
 def map_reasoning_to_thinking(request_body: dict) -> Optional[dict]:
     thinking = request_body.get("thinking")
     if isinstance(thinking, dict):
@@ -1137,6 +1201,33 @@ def map_reasoning_to_thinking(request_body: dict) -> Optional[dict]:
         return {"type": "enabled"}
 
     return {"type": "enabled"}
+
+
+def build_chat_function_tool(
+    name: str,
+    description: str = "",
+    parameters: Optional[dict] = None,
+    strict: Any = None,
+) -> dict:
+    function_tool = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description or "",
+            "parameters": parameters or {"type": "object", "properties": {}},
+        },
+    }
+    if strict is not None:
+        function_tool["function"]["strict"] = strict
+    return function_tool
+
+
+def flatten_namespace_tool_name(namespace_name: str, tool_name: str) -> str:
+    prefix = namespace_name or "namespace"
+    suffix = tool_name or "tool"
+    if prefix.endswith("__"):
+        return f"{prefix}{suffix}"
+    return f"{prefix}__{suffix}"
 
 
 def map_tools_to_chat(tools: Any) -> Optional[List[dict]]:
@@ -1158,24 +1249,21 @@ def map_tools_to_chat(tools: Any) -> Optional[List[dict]]:
                     description_parts.append(f"Input format: {format_summary}")
 
                 mapped_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool.get("name") or "custom_tool",
-                            "description": "\n\n".join(part for part in description_parts if part),
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "input": {
-                                        "type": "string",
-                                        "description": "Raw tool input string. Preserve the required tool-specific format exactly.",
-                                    }
-                                },
-                                "required": ["input"],
+                    build_chat_function_tool(
+                        name=tool.get("name") or "custom_tool",
+                        description="\n\n".join(part for part in description_parts if part),
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": "Raw tool input string. Preserve the required tool-specific format exactly.",
+                                }
                             },
-                            **({"strict": False} if "strict" in tool or tool_type == "custom" else {}),
+                            "required": ["input"],
                         },
-                    }
+                        strict=False if ("strict" in tool or tool_type == "custom") else None,
+                    )
                 )
                 logger.info(
                     "mapped custom tool to function name=%s",
@@ -1183,34 +1271,81 @@ def map_tools_to_chat(tools: Any) -> Optional[List[dict]]:
                 )
                 continue
 
+            if tool_type == "web_search":
+                mapped_tools.append(
+                    build_chat_function_tool(
+                        name=tool.get("name") or "web_search",
+                        description=tool.get("description") or "Search the web and return relevant results.",
+                        parameters=tool.get("parameters") or {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "Search query to run.",
+                                }
+                            },
+                            "required": ["query"],
+                        },
+                        strict=tool.get("strict") if "strict" in tool else False,
+                    )
+                )
+                logger.info("mapped built-in tool type=web_search")
+                continue
+
+            if tool_type == "namespace":
+                namespace_name = tool.get("name") or "namespace"
+                namespace_tools = tool.get("tools")
+                if isinstance(namespace_tools, list):
+                    added_count = 0
+                    for namespace_tool in namespace_tools:
+                        if not isinstance(namespace_tool, dict):
+                            continue
+                        if namespace_tool.get("type") != "function":
+                            logger.warning(
+                                "dropping unsupported namespace child type=%s namespace=%s name=%s",
+                                namespace_tool.get("type"),
+                                namespace_name,
+                                namespace_tool.get("name"),
+                            )
+                            continue
+                        mapped_tools.append(
+                            build_chat_function_tool(
+                                name=flatten_namespace_tool_name(namespace_name, namespace_tool.get("name") or ""),
+                                description=namespace_tool.get("description") or "",
+                                parameters=namespace_tool.get("parameters") or {"type": "object", "properties": {}},
+                                strict=namespace_tool.get("strict") if "strict" in namespace_tool else False,
+                            )
+                        )
+                        added_count += 1
+                    logger.info(
+                        "mapped namespace tool name=%s children=%s",
+                        namespace_name,
+                        added_count,
+                    )
+                    continue
+
             logger.warning("dropping unsupported tool type=%s name=%s", tool_type, tool.get("name"))
             continue
 
         function = tool.get("function")
         if isinstance(function, dict):
             mapped_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": function.get("name") or tool.get("name") or "",
-                        "description": function.get("description") or tool.get("description") or "",
-                        "parameters": function.get("parameters") or tool.get("parameters") or {"type": "object", "properties": {}},
-                        **({"strict": function.get("strict")} if "strict" in function else ({ "strict": tool.get("strict") } if "strict" in tool else {})),
-                    },
-                }
+                build_chat_function_tool(
+                    name=function.get("name") or tool.get("name") or "",
+                    description=function.get("description") or tool.get("description") or "",
+                    parameters=function.get("parameters") or tool.get("parameters") or {"type": "object", "properties": {}},
+                    strict=function.get("strict") if "strict" in function else (tool.get("strict") if "strict" in tool else None),
+                )
             )
             continue
 
         mapped_tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.get("name") or "",
-                    "description": tool.get("description") or "",
-                    "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
-                    **({"strict": tool.get("strict")} if "strict" in tool else {}),
-                },
-            }
+            build_chat_function_tool(
+                name=tool.get("name") or "",
+                description=tool.get("description") or "",
+                parameters=tool.get("parameters") or {"type": "object", "properties": {}},
+                strict=tool.get("strict") if "strict" in tool else None,
+            )
         )
 
     return mapped_tools
@@ -1252,6 +1387,7 @@ def make_function_call_item(tool_call: dict) -> dict:
 
 
 def make_message_item(text: str, item_id: Optional[str] = None, status: str = "completed") -> dict:
+    rendered_text = inject_markdown_file_links(text)
     return {
         "id": item_id or f"msg_{uuid.uuid4().hex}",
         "type": "message",
@@ -1260,11 +1396,11 @@ def make_message_item(text: str, item_id: Optional[str] = None, status: str = "c
         "content": [
             {
                 "type": "output_text",
-                "text": text,
+                "text": rendered_text,
                 "annotations": [],
                 "logprobs": [],
             }
-        ] if text or status == "completed" else [],
+        ] if rendered_text or status == "completed" else [],
     }
 
 
@@ -1487,6 +1623,7 @@ def convert_chat_to_responses(chat_response: dict, text_format: Optional[dict] =
         message = choices[0].get("message", {}) or {}
         content = extract_text_content(message.get("content"))
         content = normalize_structured_output_text(content, text_format)
+        content = inject_markdown_file_links(content)
         reasoning_text = get_reasoning_text(message)
         output_items = build_response_output_items(message)
 
@@ -1599,6 +1736,7 @@ async def responses_stream_generator(
         return b"data: [DONE]\n\n"
 
     def make_response(status: str, output=None, output_text: str = "", error=None):
+        rendered_output_text = inject_markdown_file_links(output_text)
         return {
             "id": response_id,
             "object": "response",
@@ -1639,7 +1777,7 @@ async def responses_stream_generator(
             "usage": final_usage,
             "user": None,
             "metadata": {},
-            "output_text": output_text,
+            "output_text": rendered_output_text,
         }
 
     def sse(event_type: str, payload: dict):
@@ -1994,6 +2132,7 @@ async def responses_stream_generator(
             final_usage["total_tokens"] = final_usage["input_tokens"] + final_usage["output_tokens"]
 
         full_text = normalize_structured_output_text(full_text, text_format)
+        full_text = inject_markdown_file_links(full_text)
 
         completed_output = []
         completed_output_by_index = {}

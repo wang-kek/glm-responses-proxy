@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-05-20
+
+### Fixed
+
+- Avoided double-converting Windows file paths that already appear inside Markdown links, preventing malformed targets like `[file](C:[file](/work/...))` that break Codex file-output rendering on Windows.
+- Added `inject_markdown_file_links` post-processing to convert bare file paths in model output into clickable Markdown links, enabling Codex Desktop to display file outputs in the right-side panel.
+- Replaced `DOCX_NAME_PATTERN` with absolute-path-only matching in DOCX auto-discovery to avoid false-positive relative-name matches.
+- Gated DOCX auto-discovery behind `DOCX_AUTO_DISCOVERY_ENABLED` env var (default off) to prevent unnecessary file scanning.
+- Added `run.sh` support for `DOCX_AUTO_DISCOVERY_ENABLED` environment variable passthrough.
+
+
+
 ## [0.1.1] - 2026-05-18
 
 ### Added
